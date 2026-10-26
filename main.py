@@ -509,10 +509,38 @@ class YJ64BaseApp(App):
                 from_stream.close()
                 to_stream.close()
             if request_code == 4701:
-                if copied_bytes != expected_bytes:
+                if copied_bytes <= 0 or copied_bytes != expected_bytes:
                     raise IOError(f"Archive transfer incomplete: copied {copied_bytes} of {expected_bytes} bytes")
-                self.status.text = "Архив памяти сохранён. Перед удалением приложения проверь, что ZIP виден в выбранной папке."
-                self._append_report("memory_archive_export_succeeded", size_bytes=copied_bytes, expected_bytes=expected_bytes, transfer_verified=True)
+                # Verify the actual destination by reopening it through Android.
+                verify_path = Path(self.user_data_dir) / "yj64-archive-readback.zip"
+                verify_stream = resolver.openInputStream(uri)
+                if verify_stream is None:
+                    raise IOError("Android could not reopen the saved archive for verification")
+                verify_bytes = 0
+                try:
+                    with verify_path.open("wb") as verify_file:
+                        while True:
+                            count = verify_stream.read(buffer)
+                            if count < 0:
+                                break
+                            verify_file.write(bytes((int(buffer[index]) & 0xff) for index in range(count)))
+                            verify_bytes += count
+                finally:
+                    verify_stream.close()
+                import zipfile
+                if verify_bytes <= 0 or verify_bytes != copied_bytes:
+                    raise IOError(f"Saved archive read-back mismatch: read {verify_bytes} of {copied_bytes} bytes")
+                if not zipfile.is_zipfile(verify_path):
+                    raise IOError("Saved file is not a valid ZIP archive")
+                with zipfile.ZipFile(verify_path, "r") as check_zip:
+                    bad_member = check_zip.testzip()
+                    if bad_member:
+                        raise IOError("Saved ZIP integrity check failed: " + bad_member)
+                    if "manifest.json" not in check_zip.namelist():
+                        raise IOError("Saved ZIP has no manifest.json")
+                verify_path.unlink(missing_ok=True)
+                self.status.text = f"Архив сохранён и проверен: {verify_bytes} байт. Проверь файл в выбранной папке."
+                self._append_report("memory_archive_export_succeeded", size_bytes=copied_bytes, expected_bytes=expected_bytes, readback_bytes=verify_bytes, zip_integrity_verified=True)
             else:
                 count = self.persistent_core.import_archive(temp_path)
                 from chat_workspace import ChatWorkspace
