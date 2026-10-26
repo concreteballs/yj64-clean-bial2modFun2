@@ -483,7 +483,7 @@ class YJ64BaseApp(App):
             return
         temp_path = Path(self.user_data_dir) / ("yj64-archive-import.zip" if request_code == 4702 else "YJ-64-backup.zip")
         try:
-            from jnius import autoclass, jarray
+            from jnius import autoclass
             PythonActivity = autoclass("org.kivy.android.PythonActivity")
             resolver = PythonActivity.mActivity.getContentResolver()
             if request_code == 4701:
@@ -494,16 +494,17 @@ class YJ64BaseApp(App):
                 to_stream = autoclass("java.io.FileOutputStream")(str(temp_path))
             if from_stream is None or to_stream is None:
                 raise IOError("Android could not open the selected file")
-            buffer = jarray('b', [0] * 8192)
             copied_bytes = 0
             expected_bytes = Path(self._archive_export_path).stat().st_size if request_code == 4701 else None
             try:
+                # Use InputStream.read() / OutputStream.write(int), which PyJNIus
+                # supports without importing the unavailable jnius.jarray helper.
                 while True:
-                    count = from_stream.read(buffer)
-                    if count < 0:
+                    value = int(from_stream.read())
+                    if value < 0:
                         break
-                    to_stream.write(buffer, 0, count)
-                    copied_bytes += count
+                    to_stream.write(value & 0xff)
+                    copied_bytes += 1
                 to_stream.flush()
             finally:
                 from_stream.close()
@@ -511,7 +512,6 @@ class YJ64BaseApp(App):
             if request_code == 4701:
                 if copied_bytes <= 0 or copied_bytes != expected_bytes:
                     raise IOError(f"Archive transfer incomplete: copied {copied_bytes} of {expected_bytes} bytes")
-                # Verify the actual destination by reopening it through Android.
                 verify_path = Path(self.user_data_dir) / "yj64-archive-readback.zip"
                 verify_stream = resolver.openInputStream(uri)
                 if verify_stream is None:
@@ -520,11 +520,11 @@ class YJ64BaseApp(App):
                 try:
                     with verify_path.open("wb") as verify_file:
                         while True:
-                            count = verify_stream.read(buffer)
-                            if count < 0:
+                            value = int(verify_stream.read())
+                            if value < 0:
                                 break
-                            verify_file.write(bytes((int(buffer[index]) & 0xff) for index in range(count)))
-                            verify_bytes += count
+                            verify_file.write(bytes((value & 0xff,)))
+                            verify_bytes += 1
                 finally:
                     verify_stream.close()
                 import zipfile
@@ -542,6 +542,11 @@ class YJ64BaseApp(App):
                 self.status.text = f"Архив сохранён и проверен: {verify_bytes} байт. Проверь файл в выбранной папке."
                 self._append_report("memory_archive_export_succeeded", size_bytes=copied_bytes, expected_bytes=expected_bytes, readback_bytes=verify_bytes, zip_integrity_verified=True)
             else:
+                if copied_bytes <= 0:
+                    raise IOError("Selected archive is empty")
+                import zipfile
+                if not zipfile.is_zipfile(temp_path):
+                    raise IOError("Selected file is not a valid ZIP archive")
                 count = self.persistent_core.import_archive(temp_path)
                 from chat_workspace import ChatWorkspace
                 self.workspace = ChatWorkspace(self.user_data_dir)
@@ -553,7 +558,7 @@ class YJ64BaseApp(App):
                         self.chat_output.text = self._render_history()
                 self.private_histories = {}
                 self.status.text = f"Архив восстановлен: {count} событий. Перезапусти приложение, если часть экранов ещё показывает старые данные."
-                self._append_report("memory_archive_import_succeeded", event_count=count, archive=str(uri))
+                self._append_report("memory_archive_import_succeeded", event_count=count, archive=str(uri), size_bytes=copied_bytes)
                 try:
                     self._archive_restore_prompt_path.write_text(
                         json.dumps({"prompted": True, "restored": True, "timestamp_ms": int(time.time() * 1000)}),
