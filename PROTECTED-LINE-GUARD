@@ -532,10 +532,38 @@ class YJ64BaseApp(App):
                 from_stream.close()
                 to_stream.close()
             if request_code == 4701:
-                if copied_bytes != expected_bytes:
+                if copied_bytes <= 0 or copied_bytes != expected_bytes:
                     raise IOError(f"Archive transfer incomplete: copied {copied_bytes} of {expected_bytes} bytes")
-                self.status.text = "Архив памяти сохранён. Перед удалением приложения проверь, что ZIP виден в выбранной папке."
-                self._append_report("memory_archive_export_succeeded", size_bytes=copied_bytes, expected_bytes=expected_bytes, transfer_verified=True)
+                # Verify the actual destination by reopening it through Android.
+                verify_path = Path(self.user_data_dir) / "yj64-archive-readback.zip"
+                verify_stream = resolver.openInputStream(uri)
+                if verify_stream is None:
+                    raise IOError("Android could not reopen the saved archive for verification")
+                verify_bytes = 0
+                try:
+                    with verify_path.open("wb") as verify_file:
+                        while True:
+                            count = verify_stream.read(buffer)
+                            if count < 0:
+                                break
+                            verify_file.write(bytes((int(buffer[index]) & 0xff) for index in range(count)))
+                            verify_bytes += count
+                finally:
+                    verify_stream.close()
+                import zipfile
+                if verify_bytes <= 0 or verify_bytes != copied_bytes:
+                    raise IOError(f"Saved archive read-back mismatch: read {verify_bytes} of {copied_bytes} bytes")
+                if not zipfile.is_zipfile(verify_path):
+                    raise IOError("Saved file is not a valid ZIP archive")
+                with zipfile.ZipFile(verify_path, "r") as check_zip:
+                    bad_member = check_zip.testzip()
+                    if bad_member:
+                        raise IOError("Saved ZIP integrity check failed: " + bad_member)
+                    if "manifest.json" not in check_zip.namelist():
+                        raise IOError("Saved ZIP has no manifest.json")
+                verify_path.unlink(missing_ok=True)
+                self.status.text = f"Архив сохранён и проверен: {verify_bytes} байт. Проверь файл в выбранной папке."
+                self._append_report("memory_archive_export_succeeded", size_bytes=copied_bytes, expected_bytes=expected_bytes, readback_bytes=verify_bytes, zip_integrity_verified=True)
             else:
                 count = self.persistent_core.import_archive(temp_path)
                 from chat_workspace import ChatWorkspace
@@ -3283,6 +3311,8 @@ from __future__ import annotations
 
 import json
 import ssl
+import time
+import re
 import uuid
 from pathlib import Path
 from typing import Any
@@ -3342,7 +3372,9 @@ def _request(
             return parsed
     except HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTP {exc.code}: {detail[:800]}") from exc
+        retry_after = exc.headers.get("Retry-After", "") if exc.headers else ""
+        suffix = f"; Retry-After={retry_after}" if retry_after else ""
+        raise RuntimeError(f"HTTP {exc.code}: {detail[:800]}{suffix}") from exc
     except URLError as exc:
         raise RuntimeError(f"Network error: {exc.reason}") from exc
     except json.JSONDecodeError as exc:
@@ -3787,17 +3819,35 @@ def generate_response(
         operation_id=operation, route_id=selected_route,
         provider=provider, model=model, api_method=api_method,
     )
-    try:
-        data = _request("POST", url, headers, payload=payload)
-    except Exception as exc:
-        _report(
-            report, "gateway_request_failed",
-            operation_id=operation, route_id=selected_route,
-            provider=provider, model=model, mode=selected_mode,
-            api_method=api_method, endpoint=url,
-            error_type=type(exc).__name__, error=str(exc),
-        )
-        raise
+    # Retry the same participant request after rate limits; never fall back silently.
+    rate_attempt = 0
+    while True:
+        try:
+            data = _request("POST", url, headers, payload=payload)
+            break
+        except Exception as exc:
+            message = str(exc)
+            limited = bool(re.search(r"HTTP 429|rate.?limit|too many requests|tokens per minute|requests per minute", message, re.I))
+            if not limited or rate_attempt >= 3:
+                _report(
+                    report, "gateway_request_failed",
+                    operation_id=operation, route_id=selected_route,
+                    provider=provider, model=model, mode=selected_mode,
+                    api_method=api_method, endpoint=url,
+                    error_type=type(exc).__name__, error=message,
+                    rate_limit_retry_attempt=rate_attempt,
+                )
+                raise
+            rate_attempt += 1
+            match = re.search(r"Retry-After\s*[=:]\s*([0-9]+)", message, re.I)
+            wait_seconds = max(1, min(120, int(match.group(1)))) if match else min(60, 15 * rate_attempt)
+            _report(
+                report, "gateway_rate_limit_wait",
+                operation_id=operation, route_id=selected_route,
+                provider=provider, model=model, attempt=rate_attempt,
+                wait_seconds=wait_seconds, error=message[:500],
+            )
+            time.sleep(wait_seconds)
     _report(
         report, "gateway_http_response_received",
         operation_id=operation, route_id=selected_route,
@@ -3959,7 +4009,6 @@ def test_all_routes(
     passed = sum(1 for item in results if item["status"] == "PASS")
     report_lines.extend(["", f"Summary: {passed}/{len(results)} connections passed"])
     return {"results": results, "report": "\n".join(report_lines)}
-
 END ALLOWED
 
 
@@ -4575,7 +4624,7 @@ package.name = blackmirror
 package.domain = org.blackmirror
 source.dir = .
 source.include_exts = py,json,md,txt
-version = 0.1.25
+version = 0.1.26
 requirements = python3==3.10.11,hostpython3==3.10.11,kivy==2.3.0,pyjnius,android,sh<2.0,certifi,websockets
 orientation = portrait
 fullscreen = 0
@@ -6190,12 +6239,12 @@ END ALLOWED
 
 EXPECTED-GIT-BLOB-SHA:chat_workspace.py=f1e58e926b89ecf697c88c0fef28ddc4e1a95be4
 EXPECTED-GIT-BLOB-SHA:yj64_persistent_core.py=49dd728ed922ed3a197c6fd21ac88b247bd64a3a
-EXPECTED-GIT-BLOB-SHA:buildozer.spec=87658c24bfb8ad3356a08fd1c2ffe045bc97ed93
-EXPECTED-GIT-BLOB-SHA:main.py=c6f879ebaf60acba361f62229456a9fef5dc28f8
+EXPECTED-GIT-BLOB-SHA:buildozer.spec=02eaef2c660e6c326669c673bab56f11feb148e4
+EXPECTED-GIT-BLOB-SHA:main.py=849ea4efbfdae2712ea31648002832263ac3290e
 EXPECTED-GIT-BLOB-SHA:monitor-app/app/src/main/java/org/blackmirror/yj64monitor/DiagnosticReportProvider.java=c632318b6ecb084aecbfe4814269d9d5716546e4
 EXPECTED-GIT-BLOB-SHA:config/bridge.json=d4733db70a087a9d9c6077c739b156d514a85964
 EXPECTED-GIT-BLOB-SHA:services/internal_monitor.py=fe030b51c5676c8f0fcac4e2401284d11f037d87
-EXPECTED-GIT-BLOB-SHA:llm_api.py=32571fd86a2e7207257c4ce8742d1d9f0755b115
+EXPECTED-GIT-BLOB-SHA:llm_api.py=6eac9b76ebdcd95ccdeb103242d0a6d423311f0e
 EXPECTED-GIT-BLOB-SHA:llm_settings.py=22cef481708a66ce544d395d2e655c3b9022da08
 EXPECTED-GIT-BLOB-SHA:android_src/MonitorActivity.java=b5c45286c6536eb02bb9602c51282764fee50249
 EXPECTED-GIT-BLOB-SHA:tools/verify_guard.py=887269e44f5fbffc093de87d02e7bf960f3e138b
