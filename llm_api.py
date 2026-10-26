@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import json
 import ssl
+import time
+import re
 import uuid
 from pathlib import Path
 from typing import Any
@@ -66,7 +68,9 @@ def _request(
             return parsed
     except HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTP {exc.code}: {detail[:800]}") from exc
+        retry_after = exc.headers.get("Retry-After", "") if exc.headers else ""
+        suffix = f"; Retry-After={retry_after}" if retry_after else ""
+        raise RuntimeError(f"HTTP {exc.code}: {detail[:800]}{suffix}") from exc
     except URLError as exc:
         raise RuntimeError(f"Network error: {exc.reason}") from exc
     except json.JSONDecodeError as exc:
@@ -511,17 +515,35 @@ def generate_response(
         operation_id=operation, route_id=selected_route,
         provider=provider, model=model, api_method=api_method,
     )
-    try:
-        data = _request("POST", url, headers, payload=payload)
-    except Exception as exc:
-        _report(
-            report, "gateway_request_failed",
-            operation_id=operation, route_id=selected_route,
-            provider=provider, model=model, mode=selected_mode,
-            api_method=api_method, endpoint=url,
-            error_type=type(exc).__name__, error=str(exc),
-        )
-        raise
+    # Retry the same participant request after rate limits; never fall back silently.
+    rate_attempt = 0
+    while True:
+        try:
+            data = _request("POST", url, headers, payload=payload)
+            break
+        except Exception as exc:
+            message = str(exc)
+            limited = bool(re.search(r"HTTP 429|rate.?limit|too many requests|tokens per minute|requests per minute", message, re.I))
+            if not limited or rate_attempt >= 3:
+                _report(
+                    report, "gateway_request_failed",
+                    operation_id=operation, route_id=selected_route,
+                    provider=provider, model=model, mode=selected_mode,
+                    api_method=api_method, endpoint=url,
+                    error_type=type(exc).__name__, error=message,
+                    rate_limit_retry_attempt=rate_attempt,
+                )
+                raise
+            rate_attempt += 1
+            match = re.search(r"Retry-After\s*[=:]\s*([0-9]+)", message, re.I)
+            wait_seconds = max(1, min(120, int(match.group(1)))) if match else min(60, 15 * rate_attempt)
+            _report(
+                report, "gateway_rate_limit_wait",
+                operation_id=operation, route_id=selected_route,
+                provider=provider, model=model, attempt=rate_attempt,
+                wait_seconds=wait_seconds, error=message[:500],
+            )
+            time.sleep(wait_seconds)
     _report(
         report, "gateway_http_response_received",
         operation_id=operation, route_id=selected_route,
