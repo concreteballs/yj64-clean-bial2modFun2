@@ -10,6 +10,7 @@ import traceback
 import time
 import uuid
 from pathlib import Path
+from kivy.graphics import Color, RoundedRectangle
 from typing import Any
 
 from kivy.app import App
@@ -28,6 +29,7 @@ class ChatTranscript(BoxLayout):
     """Scrollable, individually selectable chat messages with per-message copy."""
     def __init__(self, **kwargs):
         self._text = ""
+        self.message_font_size = kwargs.pop("message_font_size", 14)
         super().__init__(orientation="vertical", spacing=8, padding=(4, 5), **kwargs)
 
     @property
@@ -51,7 +53,7 @@ class ChatTranscript(BoxLayout):
         value = self._text.strip()
         if not value:
             return []
-        chunks = re.split(r"\n\n(?=(?:Owner|Participant [123]|YJ-64|User|Participant):\n)", value)
+        chunks = re.split(r"\n\n(?=(?:Owner|Participant [123](?: \[[^\]]+\])?(?: · Раунд \d+)?|YJ-64|User|Participant):\n)", value)
         result = []
         for chunk in chunks:
             first, sep, body = chunk.partition("\n")
@@ -77,15 +79,23 @@ class ChatTranscript(BoxLayout):
         for role, body, raw in parts:
             owner = role.lower() in {"owner", "user"}
             participant = role.startswith("Participant")
-            right_aligned = owner or role == "Participant 2"
+            import re
+            identity_match = re.match(r"^(Participant [123])", role)
+            identity = identity_match.group(1) if identity_match else role
+            right_aligned = owner or identity == "Participant 2"
             colors = {"Participant 1": (0.04,0.32,0.66,1), "Participant 2": (0.42,0.16,0.56,1), "Participant 3": (0.04,0.43,0.29,1)}
-            color = (0.56,0.31,0.04,1) if owner else colors.get(role, (0.18,0.23,0.34,1))
+            color = (0.56,0.31,0.04,1) if owner else colors.get(identity, (0.18,0.23,0.34,1))
             body_height = max(72, min(420, (len(body.splitlines()) + max(1, len(body)//48))*18 + 8))
             row = BoxLayout(orientation="horizontal", spacing=5, size_hint_y=None, height=body_height + 80)
             if not right_aligned:
                 row.add_widget(Label(text="", size_hint_x=0.08))
             bubble = BoxLayout(orientation="vertical", spacing=4, padding=7, size_hint_x=0.92 if right_aligned else 0.84)
-            participant_icon = {"Participant 1": "🔷", "Participant 2": "🟣", "Participant 3": "🟢"}.get(role, "🤖")
+            with bubble.canvas.before:
+                bubble_color = Color(*color)
+                bubble_background = RoundedRectangle(pos=bubble.pos, size=bubble.size, radius=[10])
+            bubble.bind(pos=lambda widget, value, shape=bubble_background: setattr(shape, "pos", value))
+            bubble.bind(size=lambda widget, value, shape=bubble_background: setattr(shape, "size", value))
+            participant_icon = {"Participant 1": "🔷", "Participant 2": "🟣", "Participant 3": "🟢"}.get(identity, "🤖")
             title = Label(text=("👤 " if owner else (participant_icon + " " if participant else "ℹ️ ")) + role, size_hint_y=None, height=24, halign="left", valign="middle", color=(0.94,0.97,1,1), bold=True, font_size="12sp")
             title.bind(size=lambda inst, val: setattr(inst, "text_size", (max(1,val[0]-4), val[1])))
             bubble.add_widget(title)
@@ -98,7 +108,7 @@ class ChatTranscript(BoxLayout):
             )
             message = Label(
                 text=body, size_hint_y=None, halign="left", valign="top",
-                color=(0.96,0.97,1,1), font_size="13sp",
+                color=(0.96,0.97,1,1), font_size=f"{self.message_font_size}sp",
             )
             message.bind(
                 width=lambda instance, value: setattr(
@@ -242,6 +252,10 @@ class YJ64BaseApp(App):
         )
 
         self.ui_language = self._load_language()
+        self.chat_ui_settings_path = Path(self.user_data_dir) / "yj64-workspace" / "chat-ui-settings.json"
+        self.chat_ui_settings = self._load_chat_ui_settings()
+        self.chat_font_size = int(self.chat_ui_settings.get("font_size", 14))
+        self.participant_display_names = self.chat_ui_settings.get("participant_names", {})
         self.participant_live_status = {"Participant 1": False, "Participant 2": False, "Participant 3": False}
         Window.clearcolor = (0.025, 0.045, 0.095, 1)
         root = BoxLayout(orientation="vertical", padding=(6, 5), spacing=5)
@@ -314,7 +328,7 @@ class YJ64BaseApp(App):
         root.add_widget(self.chat_heading)
         chat_area = BoxLayout(orientation="horizontal", spacing=6)
         self.chat_scroll = ScrollView(size_hint_x=1, do_scroll_x=False, do_scroll_y=True, bar_width=8, scroll_type=["bars","content"], bar_color=(0.36,0.66,1,1), bar_inactive_color=(0.28,0.53,0.85,0.45))
-        self.chat_output = ChatTranscript(size_hint_y=None, height=max(150,Window.height*0.45))
+        self.chat_output = ChatTranscript(size_hint_y=None, height=max(150,Window.height*0.45), message_font_size=self.chat_font_size)
         self.chat_output.text = self._render_history()
         self.chat_scroll.add_widget(self.chat_output)
         chat_area.add_widget(self.chat_scroll)
@@ -386,7 +400,8 @@ class YJ64BaseApp(App):
         actions = [
             ("СОЗДАТЬ АРХИВ ПАМЯТИ", self._create_memory_archive),
             ("ВОССТАНОВИТЬ ИЗ ZIP", self._choose_memory_archive),
-            (self._t(5), self._open_tools_menu),
+            ("НАСТРОЙКИ ЧАТА: ШРИФТ И ИМЕНА", self._open_chat_appearance_settings),
+            (self._t(5), self._open_tools_menu)
             (self._t(6), self._show_chats),
             (self._t(7), self._new_chat),
             (self._t(11), self._open_skills_editor),
@@ -404,6 +419,45 @@ class YJ64BaseApp(App):
         content.add_widget(close)
         popup.open()
         self._append_report("main_menu_opened", actions=["tools_monitor", "chats", "new_chat", "global_skills_file"])
+
+    def _load_chat_ui_settings(self) -> dict[str, Any]:
+        try:
+            data = json.loads(self.chat_ui_settings_path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                names = data.get("participant_names", {})
+                if not isinstance(names, dict): names = {}
+                clean = {f"Participant {i}": str(names.get(f"Participant {i}", "")).strip()[:32] for i in (1, 2, 3)}
+                return {"font_size": max(10, min(24, int(data.get("font_size", 14)))), "participant_names": clean}
+        except (OSError, ValueError, TypeError):
+            pass
+        return {"font_size": 14, "participant_names": {f"Participant {i}": "" for i in (1, 2, 3)}}
+
+    def _participant_display_name(self, participant: str) -> str:
+        return str(self.participant_display_names.get(participant, "") or "").strip() or participant
+
+    def _open_chat_appearance_settings(self, *_: Any) -> None:
+        content = BoxLayout(orientation="vertical", spacing=8, padding=12)
+        content.add_widget(Label(text="Размер шрифта сообщений (10–24 sp)", size_hint_y=None, height=32))
+        font_input = TextInput(text=str(self.chat_font_size), multiline=False, input_filter="int", size_hint_y=None, height=44)
+        content.add_widget(font_input)
+        fields = {}
+        for participant in ("Participant 1", "Participant 2", "Participant 3"):
+            field = TextInput(text=str(self.participant_display_names.get(participant, "")), hint_text=f"Имя: {participant}", multiline=False, size_hint_y=None, height=44)
+            content.add_widget(field); fields[participant] = field
+        popup = Popup(title="НАСТРОЙКИ ЧАТА", content=content, size_hint=(0.92, 0.82), auto_dismiss=False)
+        def save(*_args):
+            try: size = max(10, min(24, int(font_input.text or "14")))
+            except ValueError: size = 14
+            names = {key: value.text.strip()[:32] for key, value in fields.items()}
+            settings = {"font_size": size, "participant_names": names}
+            self.chat_ui_settings_path.parent.mkdir(parents=True, exist_ok=True)
+            self.chat_ui_settings_path.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
+            self.chat_ui_settings = settings; self.chat_font_size = size; self.participant_display_names = names
+            self.chat_output.message_font_size = size; self.chat_output.text = self._render_history()
+            popup.dismiss(); self._append_report("chat_appearance_settings_saved", font_size=size)
+        save_button = FeedbackButton(text="СОХРАНИТЬ", size_hint_y=None, height=46); save_button.bind(on_release=save); content.add_widget(save_button)
+        close = FeedbackButton(text="ЗАКРЫТЬ", size_hint_y=None, height=40); close.bind(on_release=lambda *_: popup.dismiss()); content.add_widget(close)
+        popup.open()
 
     def _offer_archive_restore(self, *_: Any) -> None:
         """Offer archive import once per installation; never block normal startup."""
@@ -433,6 +487,7 @@ class YJ64BaseApp(App):
     def _create_memory_archive(self, *_: Any) -> None:
         """Create a portable ZIP then let Android's document picker save it outside app data."""
         try:
+            self._save_common_history()
             temp_path = Path(self.user_data_dir) / "YJ-64-backup.zip"
             self.persistent_core.export_archive(temp_path)
             from jnius import autoclass
@@ -772,12 +827,18 @@ class YJ64BaseApp(App):
         for item in self.common_history:
             content = str(item.get("content", ""))
             if item.get("role") == "user":
-                role = "Owner"
-                body = content
-            elif ": " in content and content.split(": ", 1)[0] in {"Participant 1", "Participant 2", "Participant 3", "Owner"}:
+                role, body = "Owner", content
+            elif ": " in content and content.split(": ", 1)[0].split(" [", 1)[0].split(" · Раунд ", 1)[0] in {"Participant 1", "Participant 2", "Participant 3", "Owner"}:
                 role, body = content.split(": ", 1)
             else:
                 role, body = "YJ-64", content
+            if role.startswith("Participant "):
+                import re
+                match = re.match(r"^(Participant [123])(?: \[([^\]]+)\])?(?: · Раунд (\d+))?$", role)
+                if match:
+                    canonical, _saved_name, round_no = match.groups()
+                    role = self._participant_display_name(canonical)
+                    if round_no: role += f" · Раунд {round_no}"
             rendered.append(f"{role}:\n{body}")
         return "\n\n".join(rendered) or "New chat. Write a message below."
 
@@ -2675,7 +2736,8 @@ class YJ64BaseApp(App):
                             response = str(result.get("response") or "").strip()
                             if not response:
                                 raise RuntimeError("Provider returned an empty response; turn marked as failed.")
-                            self.common_history.append({"role": "assistant", "content": f"{name}: {response}"})
+                            display_name = self._participant_display_name(name)
+                            self.common_history.append({"role": "assistant", "content": f"{name} [{display_name}] · Раунд {round_number}: {response}"})
                             self._save_common_history()
                             successful += 1
                             successful_this_round += 1
@@ -2692,7 +2754,7 @@ class YJ64BaseApp(App):
                             )
                             Clock.schedule_once(
                                 lambda _dt, speaker=name, body=response, rn=round_number:
-                                    self._append_chat_text(f"{speaker}: {body}"),
+                                    self._append_chat_text(f"{speaker} [{self._participant_display_name(speaker)}] · Раунд {rn}: {body}"),
                                 0,
                             )
                         except Exception as exc:
@@ -2700,7 +2762,7 @@ class YJ64BaseApp(App):
                             failed_this_round += 1
                             self.participant_live_status[name] = False
                             err = f"{type(exc).__name__}: {exc}"
-                            self.common_history.append({"role": "assistant", "content": f"{name}: ERROR: {err}"})
+                            self.common_history.append({"role": "assistant", "content": f"{name} [{self._participant_display_name(name)}] · Раунд {round_number}: ERROR: {err}"})
                             self._save_common_history()
                             self._append_report(
                                 "llm_chat_participant_turn_failed",
