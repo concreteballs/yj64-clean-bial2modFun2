@@ -1114,6 +1114,7 @@ class YJ64BaseApp(App):
         content = BoxLayout(orientation="vertical", spacing=8, padding=12)
         popup = Popup(title="TOOLS / MONITOR / DIAGNOSTICS", content=content, size_hint=(0.92, 0.84))
         actions = [
+            ("EDIT CURRENT CHAT CONTEXT", self._open_context_editor),
             ("OPEN INTERNAL MONITOR", self._open_monitor),
             ("TEST LLM API + COPY REPORT", self._test_llm_api),
             ("TEST LLM GENERATION + COPY", self._test_llm_generation),
@@ -1133,6 +1134,49 @@ class YJ64BaseApp(App):
         content.add_widget(close)
         popup.open()
         self._append_report("tools_menu_opened", actions=[item[0] for item in actions])
+
+    def _open_context_editor(self, *_: Any) -> None:
+        """Edit the current chat context as plain text and persist it as valid JSON."""
+        chat_id = str(self.current_chat_id)
+        try:
+            current = "\n\n".join(str(item.get("content", "")) for item in self.workspace.load_messages(chat_id))
+        except Exception as exc:
+            self.status.text = "Не удалось прочитать контекст: " + str(exc)
+            self._append_report("context_editor_read_failed", chat_id=chat_id, error=str(exc))
+            return
+        content = BoxLayout(orientation="vertical", spacing=8, padding=10)
+        note = Label(text="Редактируется контекст текущего чата. Сохранение заменит его одним сообщением владельца.\n" + str(self.workspace._messages_path(chat_id)), size_hint_y=None, height=64, halign="left", valign="middle")
+        note.bind(size=lambda widget, value: setattr(widget, "text_size", (max(1, value[0]-12), value[1]-6)))
+        editor = TextInput(text=current, multiline=True, size_hint=(1, 1), write_tab=False, padding=(10, 10))
+        content.add_widget(note)
+        content.add_widget(editor)
+        buttons = BoxLayout(size_hint_y=None, height=48, spacing=8)
+        save = FeedbackButton(text="СОХРАНИТЬ КОНТЕКСТ")
+        close = FeedbackButton(text="ОТМЕНА")
+        buttons.add_widget(save)
+        buttons.add_widget(close)
+        content.add_widget(buttons)
+        popup = Popup(title="YJ-64 — РЕДАКТОР КОНТЕКСТА", content=content, size_hint=(0.96, 0.90))
+        def save_context(*_args: Any) -> None:
+            try:
+                value = editor.text
+                messages = [{"role": "user", "content": value}] if value.strip() else []
+                self.workspace.save_messages(chat_id, messages)
+                if self.workspace.load_messages(chat_id) != messages:
+                    raise IOError("Контекст не прошёл проверку после сохранения")
+                self.current_chat_id = chat_id
+                self.common_history = messages
+                self.chat_output.text = self._render_history()
+                self.status.text = f"Контекст сохранён и проверен: {len(value)} символов."
+                self._append_report("context_editor_saved", chat_id=chat_id, character_count=len(value), history_count=len(messages), path=str(self.workspace._messages_path(chat_id)))
+                popup.dismiss()
+            except Exception as exc:
+                self.status.text = "Ошибка сохранения контекста: " + str(exc)
+                self._append_report("context_editor_save_failed", chat_id=chat_id, error=str(exc))
+        save.bind(on_release=save_context)
+        close.bind(on_release=lambda *_: popup.dismiss())
+        popup.open()
+        self._append_report("context_editor_opened", chat_id=chat_id, character_count=len(current), path=str(self.workspace._messages_path(chat_id)))
 
     def _copy_diagnostic_report(self, *_: Any) -> None:
         report = self._read_report_text()
@@ -4788,7 +4832,7 @@ package.name = blackmirror
 package.domain = org.blackmirror
 source.dir = .
 source.include_exts = py,json,md,txt
-version = 0.1.29
+version = 0.1.30
 requirements = python3==3.10.11,hostpython3==3.10.11,kivy==2.3.0,pyjnius,android,sh<2.0,certifi,websockets
 orientation = portrait
 fullscreen = 0
@@ -6383,17 +6427,47 @@ class PersistentCore:
             if "manifest.json" not in names:
                 raise ValueError("Archive manifest is missing")
             manifest = json.loads(archive.read("manifest.json").decode("utf-8"))
-            if manifest.get("schema") != "yj64.archive.v1":
+            if not isinstance(manifest, dict) or manifest.get("schema") != "yj64.archive.v1":
                 raise ValueError("Unsupported YJ-64 archive schema")
-            for info in archive.infolist():
-                name = info.filename
-                if info.is_dir() or name == "manifest.json" or name == "yj64-events-export.json":
-                    continue
+            declared = manifest.get("files")
+            if not isinstance(declared, list) or not all(isinstance(name, str) for name in declared):
+                raise ValueError("Archive manifest file list is missing or invalid")
+            payloads = {
+                info.filename: archive.read(info)
+                for info in archive.infolist()
+                if not info.is_dir() and info.filename not in {"manifest.json", "yj64-events-export.json"}
+            }
+            if set(declared) - {"yj64-events-export.json"} != set(payloads):
+                raise ValueError("Archive contents do not match manifest file list")
+            index_name = "yj64-workspace/chats.json"
+            if index_name not in payloads:
+                raise ValueError("Archive is incomplete: chat index is missing")
+            try:
+                index = json.loads(payloads[index_name].decode("utf-8"))
+                chats = index.get("chats", []) if isinstance(index, dict) else []
+                ids = [str(item.get("id", "")) for item in chats if isinstance(item, dict)]
+                if not ids:
+                    raise ValueError("Archive has no saved chat entries")
+                for chat_id in ids:
+                    safe_id = "".join(c for c in chat_id if c.isalnum() or c in "-_")
+                    history_name = "yj64-workspace/chats/" + safe_id + ".json"
+                    if not safe_id or history_name not in payloads:
+                        raise ValueError("Archive is incomplete: chat history is missing")
+                    history = json.loads(payloads[history_name].decode("utf-8"))
+                    if not isinstance(history, list) or not all(
+                        isinstance(item, dict) and "role" in item and "content" in item
+                        for item in history
+                    ):
+                        raise ValueError("Archive contains invalid chat history JSON")
+            except (UnicodeDecodeError, json.JSONDecodeError, AttributeError, TypeError) as exc:
+                raise ValueError("Archive workspace JSON is invalid") from exc
+            # Validate every destination before writing any content.
+            for name in payloads:
                 if not name.startswith(allowed_roots) or Path(name).is_absolute() or ".." in Path(name).parts:
                     raise ValueError("Archive contains an unsupported path")
+            for name, payload in payloads.items():
                 target = self.root / name
                 target.parent.mkdir(parents=True, exist_ok=True)
-                payload = archive.read(info)
                 temp = target.with_suffix(target.suffix + ".importing")
                 temp.write_bytes(payload)
                 os.replace(temp, target)
@@ -6402,9 +6476,9 @@ class PersistentCore:
 END ALLOWED
 
 EXPECTED-GIT-BLOB-SHA:chat_workspace.py=f1e58e926b89ecf697c88c0fef28ddc4e1a95be4
-EXPECTED-GIT-BLOB-SHA:yj64_persistent_core.py=49dd728ed922ed3a197c6fd21ac88b247bd64a3a
-EXPECTED-GIT-BLOB-SHA:buildozer.spec=862ad6f3cd5adf4456e40c412aa316fe906e111d
-EXPECTED-GIT-BLOB-SHA:main.py=bdd8b44854458a79bb4301a93b272daedf3196c2
+EXPECTED-GIT-BLOB-SHA:yj64_persistent_core.py=b960db62a691b0836c6f3c1c7637e87d1f62f596
+EXPECTED-GIT-BLOB-SHA:buildozer.spec=11fa68519cc879a52f599b11b3183e7cd6c13e28
+EXPECTED-GIT-BLOB-SHA:main.py=b248e6c597caafed4f7b7d7df41e081f6ce039ee
 EXPECTED-GIT-BLOB-SHA:monitor-app/app/src/main/java/org/blackmirror/yj64monitor/DiagnosticReportProvider.java=c632318b6ecb084aecbfe4814269d9d5716546e4
 EXPECTED-GIT-BLOB-SHA:config/bridge.json=d4733db70a087a9d9c6077c739b156d514a85964
 EXPECTED-GIT-BLOB-SHA:services/internal_monitor.py=fe030b51c5676c8f0fcac4e2401284d11f037d87
