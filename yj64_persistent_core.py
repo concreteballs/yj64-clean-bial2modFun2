@@ -81,17 +81,47 @@ class PersistentCore:
             if "manifest.json" not in names:
                 raise ValueError("Archive manifest is missing")
             manifest = json.loads(archive.read("manifest.json").decode("utf-8"))
-            if manifest.get("schema") != "yj64.archive.v1":
+            if not isinstance(manifest, dict) or manifest.get("schema") != "yj64.archive.v1":
                 raise ValueError("Unsupported YJ-64 archive schema")
-            for info in archive.infolist():
-                name = info.filename
-                if info.is_dir() or name == "manifest.json" or name == "yj64-events-export.json":
-                    continue
+            declared = manifest.get("files")
+            if not isinstance(declared, list) or not all(isinstance(name, str) for name in declared):
+                raise ValueError("Archive manifest file list is missing or invalid")
+            payloads = {
+                info.filename: archive.read(info)
+                for info in archive.infolist()
+                if not info.is_dir() and info.filename not in {"manifest.json", "yj64-events-export.json"}
+            }
+            if set(declared) - {"yj64-events-export.json"} != set(payloads):
+                raise ValueError("Archive contents do not match manifest file list")
+            index_name = "yj64-workspace/chats.json"
+            if index_name not in payloads:
+                raise ValueError("Archive is incomplete: chat index is missing")
+            try:
+                index = json.loads(payloads[index_name].decode("utf-8"))
+                chats = index.get("chats", []) if isinstance(index, dict) else []
+                ids = [str(item.get("id", "")) for item in chats if isinstance(item, dict)]
+                if not ids:
+                    raise ValueError("Archive has no saved chat entries")
+                for chat_id in ids:
+                    safe_id = "".join(c for c in chat_id if c.isalnum() or c in "-_")
+                    history_name = "yj64-workspace/chats/" + safe_id + ".json"
+                    if not safe_id or history_name not in payloads:
+                        raise ValueError("Archive is incomplete: chat history is missing")
+                    history = json.loads(payloads[history_name].decode("utf-8"))
+                    if not isinstance(history, list) or not all(
+                        isinstance(item, dict) and "role" in item and "content" in item
+                        for item in history
+                    ):
+                        raise ValueError("Archive contains invalid chat history JSON")
+            except (UnicodeDecodeError, json.JSONDecodeError, AttributeError, TypeError) as exc:
+                raise ValueError("Archive workspace JSON is invalid") from exc
+            # Validate every destination before writing any content.
+            for name in payloads:
                 if not name.startswith(allowed_roots) or Path(name).is_absolute() or ".." in Path(name).parts:
                     raise ValueError("Archive contains an unsupported path")
+            for name, payload in payloads.items():
                 target = self.root / name
                 target.parent.mkdir(parents=True, exist_ok=True)
-                payload = archive.read(info)
                 temp = target.with_suffix(target.suffix + ".importing")
                 temp.write_bytes(payload)
                 os.replace(temp, target)
