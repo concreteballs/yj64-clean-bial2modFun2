@@ -994,6 +994,7 @@ class YJ64BaseApp(App):
         content = BoxLayout(orientation="vertical", spacing=8, padding=12)
         popup = Popup(title="TOOLS / MONITOR / DIAGNOSTICS", content=content, size_hint=(0.92, 0.84))
         actions = [
+            ("EDIT CURRENT CHAT CONTEXT", self._open_context_editor),
             ("OPEN INTERNAL MONITOR", self._open_monitor),
             ("TEST LLM API + COPY REPORT", self._test_llm_api),
             ("TEST LLM GENERATION + COPY", self._test_llm_generation),
@@ -1013,6 +1014,49 @@ class YJ64BaseApp(App):
         content.add_widget(close)
         popup.open()
         self._append_report("tools_menu_opened", actions=[item[0] for item in actions])
+
+    def _open_context_editor(self, *_: Any) -> None:
+        """Edit the current chat context as plain text and persist it as valid JSON."""
+        chat_id = str(self.current_chat_id)
+        try:
+            current = "\n\n".join(str(item.get("content", "")) for item in self.workspace.load_messages(chat_id))
+        except Exception as exc:
+            self.status.text = "Не удалось прочитать контекст: " + str(exc)
+            self._append_report("context_editor_read_failed", chat_id=chat_id, error=str(exc))
+            return
+        content = BoxLayout(orientation="vertical", spacing=8, padding=10)
+        note = Label(text="Редактируется контекст текущего чата. Сохранение заменит его одним сообщением владельца.\n" + str(self.workspace._messages_path(chat_id)), size_hint_y=None, height=64, halign="left", valign="middle")
+        note.bind(size=lambda widget, value: setattr(widget, "text_size", (max(1, value[0]-12), value[1]-6)))
+        editor = TextInput(text=current, multiline=True, size_hint=(1, 1), write_tab=False, padding=(10, 10))
+        content.add_widget(note)
+        content.add_widget(editor)
+        buttons = BoxLayout(size_hint_y=None, height=48, spacing=8)
+        save = FeedbackButton(text="СОХРАНИТЬ КОНТЕКСТ")
+        close = FeedbackButton(text="ОТМЕНА")
+        buttons.add_widget(save)
+        buttons.add_widget(close)
+        content.add_widget(buttons)
+        popup = Popup(title="YJ-64 — РЕДАКТОР КОНТЕКСТА", content=content, size_hint=(0.96, 0.90))
+        def save_context(*_args: Any) -> None:
+            try:
+                value = editor.text
+                messages = [{"role": "user", "content": value}] if value.strip() else []
+                self.workspace.save_messages(chat_id, messages)
+                if self.workspace.load_messages(chat_id) != messages:
+                    raise IOError("Контекст не прошёл проверку после сохранения")
+                self.current_chat_id = chat_id
+                self.common_history = messages
+                self.chat_output.text = self._render_history()
+                self.status.text = f"Контекст сохранён и проверен: {len(value)} символов."
+                self._append_report("context_editor_saved", chat_id=chat_id, character_count=len(value), history_count=len(messages), path=str(self.workspace._messages_path(chat_id)))
+                popup.dismiss()
+            except Exception as exc:
+                self.status.text = "Ошибка сохранения контекста: " + str(exc)
+                self._append_report("context_editor_save_failed", chat_id=chat_id, error=str(exc))
+        save.bind(on_release=save_context)
+        close.bind(on_release=lambda *_: popup.dismiss())
+        popup.open()
+        self._append_report("context_editor_opened", chat_id=chat_id, character_count=len(current), path=str(self.workspace._messages_path(chat_id)))
 
     def _copy_diagnostic_report(self, *_: Any) -> None:
         report = self._read_report_text()
