@@ -487,6 +487,91 @@ class YJ64BaseApp(App):
         popup.open()
         self._append_report("memory_archive_restore_offered")
 
+    def _auto_export_download_archive(self, *_: Any) -> None:
+        """Create a verified archive in public Downloads/YJ-64 without opening a picker."""
+        temp_path = Path(self.user_data_dir) / "YJ-64-backup-auto.zip"
+        verify_path = Path(self.user_data_dir) / "YJ-64-backup-auto-verify.zip"
+        uri = None
+        try:
+            self._save_common_history()
+            self.persistent_core.export_archive(temp_path)
+            from jnius import autoclass
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+            ContentValues = autoclass("android.content.ContentValues")
+            MediaStoreDownloads = autoclass("android.provider.MediaStore$Downloads")
+            resolver = PythonActivity.mActivity.getContentResolver()
+            stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+            values = ContentValues()
+            values.put("display_name", "YJ-64-backup-" + stamp + ".zip")
+            values.put("mime_type", "application/zip")
+            values.put("relative_path", "Download/YJ-64/")
+            values.put("is_pending", 1)
+            uri = resolver.insert(MediaStoreDownloads.EXTERNAL_CONTENT_URI, values)
+            if uri is None:
+                raise IOError("Android MediaStore did not create a Downloads file")
+            output = resolver.openOutputStream(uri)
+            if output is None:
+                raise IOError("Android could not open the Downloads archive for writing")
+            copied = 0
+            try:
+                with temp_path.open("rb") as source:
+                    while True:
+                        chunk = source.read(65536)
+                        if not chunk:
+                            break
+                        for value_byte in chunk:
+                            output.write(value_byte)
+                        copied += len(chunk)
+                output.flush()
+            finally:
+                output.close()
+            expected = temp_path.stat().st_size
+            if copied != expected or copied <= 0:
+                raise IOError(f"Downloads archive size mismatch: {copied} of {expected} bytes")
+            readback = resolver.openInputStream(uri)
+            if readback is None:
+                raise IOError("Android could not reopen the Downloads archive")
+            read_count = 0
+            try:
+                with verify_path.open("wb") as verify_file:
+                    while True:
+                        value_byte = int(readback.read())
+                        if value_byte < 0:
+                            break
+                        verify_file.write(bytes((value_byte & 0xff,)))
+                        read_count += 1
+            finally:
+                readback.close()
+            import zipfile
+            if read_count != copied or not zipfile.is_zipfile(verify_path):
+                raise IOError("Downloads archive read-back or ZIP integrity check failed")
+            with zipfile.ZipFile(verify_path, "r") as check_zip:
+                bad_member = check_zip.testzip()
+                if bad_member or "manifest.json" not in check_zip.namelist():
+                    raise IOError("Downloads archive is incomplete or has a corrupt member")
+            values_done = ContentValues()
+            values_done.put("is_pending", 0)
+            resolver.update(uri, values_done, None, None)
+            self._append_report("memory_archive_auto_download_succeeded",
+                                size_bytes=copied, readback_bytes=read_count,
+                                location="Download/YJ-64", zip_integrity_verified=True)
+            self._archive_auto_export_error = ""
+        except Exception as exc:
+            self._archive_auto_export_error = f"{type(exc).__name__}: {exc}"
+            self._append_report("memory_archive_auto_download_failed",
+                                error_type=type(exc).__name__, error=str(exc),
+                                location="Download/YJ-64")
+            if uri is not None:
+                try:
+                    from jnius import autoclass
+                    PythonActivity = autoclass("org.kivy.android.PythonActivity")
+                    PythonActivity.mActivity.getContentResolver().delete(uri, None, None)
+                except Exception:
+                    pass
+        finally:
+            temp_path.unlink(missing_ok=True)
+            verify_path.unlink(missing_ok=True)
+
     def _create_memory_archive(self, *_: Any) -> None:
         """Create a portable ZIP then let Android's document picker save it outside app data."""
         try:
