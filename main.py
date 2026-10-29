@@ -382,6 +382,7 @@ class YJ64BaseApp(App):
         )
 
         Clock.schedule_once(self._offer_archive_restore, 1.2)
+        Clock.schedule_once(self._auto_export_download_archive, 2.0)
         Clock.schedule_once(self._ensure_service_started, 0.5)
         Clock.schedule_interval(self._refresh_status, 1.0)
         Clock.schedule_interval(self._refresh_participant_buttons, 1.0)
@@ -3176,6 +3177,11 @@ class YJ64BaseApp(App):
 
     def on_pause(self) -> bool:
         self._append_report("base_activity_paused")
+        try:
+            self._save_common_history()
+            self._auto_export_download_archive()
+        except Exception as exc:
+            self._append_report("memory_archive_auto_pause_failed", error_type=type(exc).__name__, error=str(exc))
         return True
 
     def on_stop(self) -> None:
