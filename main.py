@@ -410,7 +410,10 @@ class YJ64BaseApp(App):
             button = FeedbackButton(text=label, size_hint_y=None, height=50, font_size="13sp",
                             background_normal="", background_down="",
                             background_color=(0.10,0.20,0.36,1), color=(0.93,0.96,1,1))
-            button.bind(on_release=lambda _button, action=callback: (popup.dismiss(), action()))
+            def invoke(_button: Any, action: Any = callback) -> None:
+                popup.dismiss()
+                Clock.schedule_once(lambda _dt, selected=action: selected(), 0.15)
+            button.bind(on_release=invoke)
             content.add_widget(button)
         close = FeedbackButton(text="ЗАКРЫТЬ", size_hint_y=None, height=42,
                        background_normal="", background_color=(0.13,0.31,0.53,1),
@@ -1006,7 +1009,7 @@ class YJ64BaseApp(App):
             button = FeedbackButton(text=label, size_hint_y=None, height=54)
             def invoke(_button: Any, action: Any = callback) -> None:
                 popup.dismiss()
-                action()
+                Clock.schedule_once(lambda _dt, selected=action: selected(), 0.15)
             button.bind(on_release=invoke)
             content.add_widget(button)
         close = FeedbackButton(text="CLOSE", size_hint_y=None, height=48)
