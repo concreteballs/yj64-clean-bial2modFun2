@@ -402,7 +402,7 @@ class YJ64BaseApp(App):
             ("СОЗДАТЬ АРХИВ ПАМЯТИ", self._create_memory_archive),
             ("ВОССТАНОВИТЬ ИЗ ZIP", self._choose_memory_archive),
             ("НАСТРОЙКИ ЧАТА: ШРИФТ И ИМЕНА", self._open_chat_appearance_settings),
-            (self._t(5), self._open_tools_menu)
+            (self._t(5), self._open_tools_menu),
             (self._t(6), self._show_chats),
             (self._t(7), self._new_chat),
             (self._t(11), self._open_skills_editor),
